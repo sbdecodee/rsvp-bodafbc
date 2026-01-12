@@ -133,6 +133,10 @@
         color: var(--text);
         border: 1px solid var(--line);
       }
+      button:disabled {
+        opacity: 0.6;
+        cursor: not-allowed;
+      }
       .primary {
         background: #ddcf9d;
         color: #87641d;
@@ -182,6 +186,7 @@
       }
     </style>
   </head>
+
   <body>
     <div class="wrap">
       <img src="recursos/logo.png" alt="Logo" class="logo" />
@@ -215,14 +220,18 @@
           </div>
 
           <div class="actions">
-            <button id="btnLookup" class="primary">Validar</button>
+            <button id="btnLookup" class="primary" type="button">
+              Validar
+            </button>
           </div>
 
           <div id="status" class="status hidden"></div>
 
           <div id="rsvpBox" class="actions hidden">
-            <button id="btnYes" class="yes">Sí, confirmo</button>
-            <button id="btnNo" class="no">No podré asistir</button>
+            <button id="btnYes" class="yes" type="button">Sí, confirmo</button>
+            <button id="btnNo" class="no" type="button">
+              No podré asistir
+            </button>
           </div>
         </div>
 
@@ -242,9 +251,15 @@
 
     <script>
       // ===== CONFIG =====
-      const API_URL = "PEGA_AQUI_TU_WEB_APP_URL";
+      // Pega aquí tu Web App URL de Apps Script (termina en /exec)
+      const API_URL =
+        "https://script.google.com/macros/s/AKfycbztgQhWmguB6jwrBRsCKhmMeQdc1E56Kbx3ecn5KEH8f8FaQgP62Y9MHjDlFDXlqtLh/exec";
+
       const DEFAULT_REDIRECT =
         "https://familiabernalcorcino.my.canva.site/invitacin---flia-bernal-corcino";
+
+      // Timeout (ms) para llamadas a Apps Script
+      const API_TIMEOUT_MS = 12000;
 
       // Puedes pasar: ?redirect=https://tu-canva...
       const params = new URLSearchParams(location.search);
@@ -254,6 +269,11 @@
       const $ = (id) => document.getElementById(id);
       const statusEl = $("status");
       const rsvpBoxEl = $("rsvpBox");
+      const firstNameEl = $("firstName");
+      const lastNameEl = $("lastName");
+
+      // Estado interno para robustez
+      let lastLookup = null; // { firstName, lastName, displayName, attendance, canChange }
 
       function showStatus(html, show = true) {
         statusEl.innerHTML = html;
@@ -266,23 +286,23 @@
         ["btnLookup", "btnYes", "btnNo"].forEach((id) => ($(id).disabled = on));
         if (on) showStatus("Procesando…", true);
       }
+
       function sanitize(s) {
-        return String(s).replace(/[<>]/g, "");
-      }
-      function getName() {
-        return {
-          firstName: $("firstName").value.trim(),
-          lastName: $("lastName").value.trim(),
-        };
+        return String(s ?? "").replace(/[<>]/g, "");
       }
 
-      async function api(action, payload) {
-        const res = await fetch(API_URL, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action, ...payload }),
-        });
-        return await res.json();
+      // Limpieza suave de input (no cambia significado, solo evita espacios raros)
+      function cleanInput(s) {
+        return String(s ?? "")
+          .replace(/\s+/g, " ")
+          .trim();
+      }
+
+      function getName() {
+        return {
+          firstName: cleanInput(firstNameEl.value),
+          lastName: cleanInput(lastNameEl.value),
+        };
       }
 
       function humanStatus(att) {
@@ -294,28 +314,70 @@
         return `Tu estado actual: <strong>${sanitize(att)}</strong>.`;
       }
 
-      $("btnLookup").addEventListener("click", async () => {
+      async function api(action, payload) {
+        if (!API_URL || API_URL.includes("PEGA_AQUI")) {
+          throw new Error("API_URL no configurado");
+        }
+
+        const controller = new AbortController();
+        const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS);
+
+        try {
+          const res = await fetch(API_URL, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action, ...payload }),
+            signal: controller.signal,
+          });
+
+          const text = await res.text();
+
+          // Apps Script a veces devuelve HTML cuando no está bien el deploy/permisos
+          let json;
+          try {
+            json = JSON.parse(text);
+          } catch (e) {
+            throw new Error(
+              "Respuesta no-JSON desde API (revisa Deploy/permisos)"
+            );
+          }
+
+          return json;
+        } finally {
+          clearTimeout(timer);
+        }
+      }
+
+      async function doLookup() {
         const { firstName, lastName } = getName();
+
         if (!firstName || !lastName) {
           showStatus(
             "Por favor completa <strong>Nombre</strong> y <strong>Apellido</strong>.",
             true
           );
           showRSVP(false);
+          lastLookup = null;
           return;
         }
+
         try {
           setLoading(true);
+
           const data = await api("lookup", { firstName, lastName });
 
           if (!data.ok) {
             showStatus(
-              "Ocurrió un error validando tu nombre. Intenta de nuevo.",
+              `Ocurrió un error validando tu nombre. ${
+                data.error ? `<br/><em>${sanitize(data.error)}</em>` : ""
+              }`,
               true
             );
             showRSVP(false);
+            lastLookup = null;
             return;
           }
+
           if (!data.found) {
             showStatus(
               `No encontramos <strong>${sanitize(firstName)} ${sanitize(
@@ -324,72 +386,134 @@
               true
             );
             showRSVP(false);
+            lastLookup = null;
             return;
           }
 
-          const msg = `Hola <strong>${sanitize(
-            data.displayName
-          )}</strong>.<br/>${humanStatus(data.attendance)}`;
-          showStatus(msg, true);
-
-          if (data.canChange) {
-            showRSVP(true);
-          } else {
-            showRSVP(false);
-            showStatus(
-              msg +
-                "<br/><em>Tu respuesta ya está registrada y no admite cambios.</em>",
-              true
-            );
-          }
-        } catch (e) {
-          showStatus(
-            "No se pudo conectar con el sistema. Intenta más tarde.",
-            true
-          );
-          showRSVP(false);
-        } finally {
-          setLoading(false);
-        }
-      });
-
-      async function setAttendance(att) {
-        const { firstName, lastName } = getName();
-        if (!firstName || !lastName) {
-          showStatus("Completa Nombre y Apellido primero.", true);
-          return;
-        }
-        try {
-          setLoading(true);
-          const data = await api("setAttendance", {
+          lastLookup = {
             firstName,
             lastName,
-            attendance: att,
-          });
-          if (data.ok) {
-            showStatus(
-              `Tu respuesta ha sido registrada. ${humanStatus(att)}`,
-              true
-            );
-            showRSVP(false);
-          } else {
-            showStatus(
-              "Error al registrar tu respuesta. Intenta de nuevo.",
-              true
-            );
-          }
+            displayName: data.displayName,
+            attendance: data.attendance || null,
+            canChange: !!data.canChange,
+          };
+
+          const msg = `Hola <strong>${sanitize(
+            data.displayName
+          )}</strong>.<br/>${humanStatus(
+            (data.attendance || "").toString().toUpperCase()
+          )}`;
+          showStatus(msg, true);
+
+          showRSVP(!!data.canChange);
         } catch (e) {
-          showStatus(
-            "No se pudo conectar con el sistema. Intenta más tarde.",
-            true
-          );
+          const msg =
+            e.name === "AbortError"
+              ? "La conexión tardó demasiado. Intenta de nuevo."
+              : "No se pudo conectar con el sistema. Verifica el enlace de API y permisos.";
+          showStatus(msg, true);
+          showRSVP(false);
+          lastLookup = null;
         } finally {
           setLoading(false);
         }
       }
 
+      async function setAttendance(att) {
+        // Bloquea confirmación si no se hizo lookup antes
+        if (!lastLookup) {
+          showStatus("Primero valida tu nombre y apellido.", true);
+          showRSVP(false);
+          return;
+        }
+
+        try {
+          setLoading(true);
+
+          const data = await api("setAttendance", {
+            firstName: lastLookup.firstName,
+            lastName: lastLookup.lastName,
+            attendance: att,
+          });
+
+          if (!data.ok) {
+            showStatus(
+              `Error al registrar tu respuesta. ${
+                data.error ? `<br/><em>${sanitize(data.error)}</em>` : ""
+              }`,
+              true
+            );
+            return;
+          }
+
+          if (data.locked) {
+            showStatus(
+              `Tu respuesta ya está registrada como <strong>${sanitize(
+                data.current
+              )}</strong> y no admite cambios.`,
+              true
+            );
+            showRSVP(false);
+            return;
+          }
+
+          if (!data.updated) {
+            showStatus("No se pudo guardar. Vuelve a validar tu nombre.", true);
+            showRSVP(false);
+            lastLookup = null;
+            return;
+          }
+
+          const msg =
+            att === "SI"
+              ? "¡Listo! <strong>Asistencia confirmada</strong>. Volviendo a la invitación…"
+              : "Entendido. <strong>Marcado como no asiste</strong>. Volviendo a la invitación…";
+
+          showStatus(msg, true);
+          showRSVP(false);
+
+          setTimeout(() => {
+            window.location.href = redirectUrl;
+          }, 1200);
+        } catch (e) {
+          const msg =
+            e.name === "AbortError"
+              ? "La conexión tardó demasiado. Intenta de nuevo."
+              : "No se pudo conectar con el sistema. Verifica el enlace de API y permisos.";
+          showStatus(msg, true);
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      // Events
+      $("btnLookup").addEventListener("click", doLookup);
       $("btnYes").addEventListener("click", () => setAttendance("SI"));
       $("btnNo").addEventListener("click", () => setAttendance("NO"));
+
+      // UX: Enter para validar
+      [firstNameEl, lastNameEl].forEach((el) => {
+        el.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") doLookup();
+        });
+      });
+
+      // UX: si cambian el input después de validar, escondemos botones y obligamos a validar de nuevo
+      function invalidateLookupIfChanged() {
+        if (!lastLookup) return;
+        const { firstName, lastName } = getName();
+        if (
+          firstName !== lastLookup.firstName ||
+          lastName !== lastLookup.lastName
+        ) {
+          lastLookup = null;
+          showRSVP(false);
+          // no borro status para que el usuario entienda, pero puedes borrarlo si quieres:
+          // showStatus("", false);
+        }
+      }
+      firstNameEl.addEventListener("input", invalidateLookupIfChanged);
+      lastNameEl.addEventListener("input", invalidateLookupIfChanged);
     </script>
   </body>
 </html>
